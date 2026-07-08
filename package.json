@@ -1,11 +1,8 @@
 {
   "name": "tg-assistant",
   "version": "1.0.0",
-  "description": "Telegram Mini App — личный ИИ-ассистент (Gemini + gdebenz + Google Search)",
   "dependencies": {
     "@google/generative-ai": "^0.24.0"
   },
-  "engines": {
-    "node": ">=18"
-  }
+  "engines": { "node": ">=18" }
 }
