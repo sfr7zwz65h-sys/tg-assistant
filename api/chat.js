@@ -1,5 +1,7 @@
-// Serverless backend: Gemini 2.0 Flash + Google Search + инструмент заправок (gdebenz.ru)
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+// Serverless backend: Gemini (новый SDK @google/genai, поддерживает auth-ключи AQ.*)
+const { GoogleGenAI } = require("@google/genai");
+
+const MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"];
 
 const SYSTEM_PROMPT = `Ты личный ИИ-ассистент. Отвечаешь по-русски, кратко и по делу.
 Инструменты:
@@ -56,10 +58,8 @@ const STATUS_LABEL = {
 async function getFuelStatus(route, fromCity, toCity) {
   const key = String(route || "").toLowerCase().replace(/\s+/g, "").replace("m", "м");
   const r = ROUTES[key] || ROUTES["м-12"];
-  if (!r) return `Трасса "${route}" не поддерживается. Доступно: М-12.`;
 
   let waypoints = r.waypoints;
-  // Обрезаем маршрут по указанным городам, если нашли их среди контрольных точек
   const idxOf = (city) =>
     city
       ? waypoints.findIndex((w) => w[0].toLowerCase().includes(String(city).toLowerCase()))
@@ -70,7 +70,6 @@ async function getFuelStatus(route, fromCity, toCity) {
     waypoints = waypoints.slice(Math.min(i1, i2), Math.max(i1, i2) + 1);
   }
 
-  // Параллельные запросы по контрольным точкам
   const results = await Promise.allSettled(
     waypoints.map(([name, lat, lon]) =>
       fetch(`https://gdebenz.ru/api/nearby?lat=${lat}&lon=${lon}&radius_km=45`)
@@ -79,7 +78,6 @@ async function getFuelStatus(route, fromCity, toCity) {
     )
   );
 
-  // Дедупликация по osm_id, сортировка запад → восток
   const seen = new Set();
   const zones = [];
   for (const res of results) {
@@ -91,7 +89,7 @@ async function getFuelStatus(route, fromCity, toCity) {
       return true;
     });
     stations.sort((a, b) => (a.lon || 0) - (b.lon || 0));
-    if (stations.length) zones.push({ zone, stations, updated: data.updated });
+    if (stations.length) zones.push({ zone, stations });
   }
 
   if (!zones.length) return `По трассе ${r.name} данных о заправках сейчас нет.`;
@@ -108,6 +106,31 @@ async function getFuelStatus(route, fromCity, toCity) {
   return lines.join("\n");
 }
 
+async function runChat(ai, model, tools, history, message) {
+  const contents = [...history, { role: "user", parts: [{ text: message }] }];
+  for (let i = 0; i < 4; i++) {
+    const resp = await ai.models.generateContent({
+      model,
+      contents,
+      config: { systemInstruction: SYSTEM_PROMPT, tools },
+    });
+    const calls = resp.functionCalls || [];
+    if (!calls.length) return resp.text || "";
+    contents.push(resp.candidates[0].content);
+    const parts = [];
+    for (const call of calls) {
+      if (call.name === "get_fuel_status") {
+        const { route, from_city, to_city } = call.args || {};
+        const report = await getFuelStatus(route, from_city, to_city);
+        parts.push({ functionResponse: { name: call.name, response: { report } } });
+      }
+    }
+    if (!parts.length) return resp.text || "";
+    contents.push({ role: "user", parts });
+  }
+  return "Не удалось получить ответ, попробуйте ещё раз.";
+}
+
 module.exports = async (req, res) => {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
@@ -116,50 +139,28 @@ module.exports = async (req, res) => {
     const { message, history = [] } = req.body || {};
     if (!message) return res.status(400).json({ error: "message is required" });
 
-    const genAI = new GoogleGenerativeAI(process.env.GEMINI_KEY);
+    const apiKey = process.env.GEMINI_KEY || process.env.GEMINI_API_KEY || process.env.geminikey;
+    if (!apiKey) return res.status(500).json({ error: "GEMINI_KEY не настроен" });
 
-    const makeModel = (tools) =>
-      genAI.getGenerativeModel({
-        model: "gemini-2.0-flash",
-        systemInstruction: SYSTEM_PROMPT,
-        tools,
-      });
+    const ai = new GoogleGenAI({ apiKey });
 
-    const runChat = async (tools) => {
-      const chat = makeModel(tools).startChat({ history });
-      let result = await chat.sendMessage(message);
-
-      // Цикл обработки functionCalls (get_fuel_status)
-      for (let i = 0; i < 3; i++) {
-        const calls = result.response.functionCalls();
-        if (!calls || !calls.length) break;
-        const responses = [];
-        for (const call of calls) {
-          if (call.name === "get_fuel_status") {
-            const { route, from_city, to_city } = call.args || {};
-            const report = await getFuelStatus(route, from_city, to_city);
-            responses.push({
-              functionResponse: { name: "get_fuel_status", response: { report } },
-            });
-          }
+    let lastError;
+    for (const model of MODELS) {
+      for (const tools of [
+        [{ googleSearch: {} }, { functionDeclarations: [FUEL_DECL] }],
+        [{ functionDeclarations: [FUEL_DECL] }],
+      ]) {
+        try {
+          const text = await runChat(ai, model, tools, history, message);
+          return res.status(200).json({ response: text });
+        } catch (e) {
+          lastError = e;
+          const msg = String(e.message || e);
+          if (/not found|NOT_FOUND|404/i.test(msg)) break;
         }
-        if (!responses.length) break;
-        result = await chat.sendMessage(responses);
       }
-      return result.response.text();
-    };
-
-    let text;
-    try {
-      // Основной вариант: Google Search + кастомный инструмент
-      text = await runChat([{ googleSearch: {} }, { functionDeclarations: [FUEL_DECL] }]);
-    } catch (e) {
-      // Некоторые версии API не позволяют смешивать googleSearch и functionDeclarations —
-      // fallback: только кастомный инструмент
-      text = await runChat([{ functionDeclarations: [FUEL_DECL] }]);
     }
-
-    return res.status(200).json({ response: text });
+    throw lastError;
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Ошибка сервера: " + (err.message || err) });
